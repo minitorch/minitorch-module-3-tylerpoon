@@ -14,6 +14,7 @@ from .tensor_data import (
     index_to_position,
     shape_broadcast,
     to_index,
+    to_index_strides,
 )
 from .tensor_ops import MapProto, TensorOps
 
@@ -22,6 +23,7 @@ from .tensor_ops import MapProto, TensorOps
 # in these functions.
 
 to_index = cuda.jit(device=True)(to_index)
+to_index_strides = cuda.jit(device=True)(to_index_strides)
 index_to_position = cuda.jit(device=True)(index_to_position)
 broadcast_index = cuda.jit(device=True)(broadcast_index)
 
@@ -149,12 +151,23 @@ def tensor_map(
         in_shape: Shape,
         in_strides: Strides,
     ) -> None:
-
-        out_index = cuda.local.array(MAX_DIMS, numba.int32)
-        in_index = cuda.local.array(MAX_DIMS, numba.int32)
         i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
-        # TODO: Implement for Task 3.3.
-        raise NotImplementedError("Need to implement for Task 3.3")
+        if i < out_size:
+            aligned = True
+            for j in range(len(out_shape)):
+                if in_strides[j] != out_strides[j]:
+                    aligned = False
+
+            if aligned:
+                out[i] = fn(in_storage[i])
+            else:
+                out_index = cuda.local.array(MAX_DIMS, numba.int32)
+                in_index = cuda.local.array(MAX_DIMS, numba.int32)
+                to_index_strides(i, out_shape, out_strides, out_index)
+                broadcast_index(out_index, out_shape, in_shape, in_index)
+                in_i = int(index_to_position(in_index, in_strides))
+
+                out[i] = fn(in_storage[in_i])
 
     return cuda.jit()(_map)  # type: ignore
 
@@ -189,14 +202,30 @@ def tensor_zip(
         b_shape: Shape,
         b_strides: Strides,
     ) -> None:
-
-        out_index = cuda.local.array(MAX_DIMS, numba.int32)
-        a_index = cuda.local.array(MAX_DIMS, numba.int32)
-        b_index = cuda.local.array(MAX_DIMS, numba.int32)
         i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+        if i < out_size:
+            aligned = len(out_shape) == len(a_shape) and len(out_shape) == len(b_shape)
+            if aligned:
+                for j in range(len(out_shape)):
+                    if a_shape[j] != out_shape[j] or b_shape[j] != out_shape[j] or a_strides[j] != out_strides[j] or b_strides[j] != out_strides[j]:
+                        aligned = False
 
-        # TODO: Implement for Task 3.3.
-        raise NotImplementedError("Need to implement for Task 3.3")
+            if aligned:
+                out[i] = fn(a_storage[i], b_storage[i])
+            else:
+                out_index = cuda.local.array(MAX_DIMS, numba.int32)
+                a_index = cuda.local.array(MAX_DIMS, numba.int32)
+                b_index = cuda.local.array(MAX_DIMS, numba.int32)
+
+                to_index_strides(i, out_shape, out_strides, out_index)
+
+                broadcast_index(out_index, out_shape, a_shape, a_index)
+                a_i = int(index_to_position(a_index, a_strides))
+
+                broadcast_index(out_index, out_shape, b_shape, b_index)
+                b_i = int(index_to_position(b_index, b_strides))
+
+                out[i] = fn(a_storage[a_i], b_storage[b_i])
 
     return cuda.jit()(_zip)  # type: ignore
 
@@ -228,8 +257,20 @@ def _sum_practice(out: Storage, a: Storage, size: int) -> None:
     i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
     pos = cuda.threadIdx.x
 
-    # TODO: Implement for Task 3.3.
-    raise NotImplementedError("Need to implement for Task 3.3")
+    if i < size:
+        cache[pos] = a[i]
+    else:
+        cache[pos] = 0
+    cuda.syncthreads()
+
+    off = BLOCK_DIM // 2
+    while off > 0:
+        if pos < off:
+            cache[pos] = cache[pos] + cache[pos + off]
+        off >>= 1
+        cuda.syncthreads()
+    if pos == 0:
+        out[cuda.blockIdx.x] = cache[0]
 
 
 jit_sum_practice = cuda.jit()(_sum_practice)
@@ -278,8 +319,30 @@ def tensor_reduce(
         out_pos = cuda.blockIdx.x
         pos = cuda.threadIdx.x
 
-        # TODO: Implement for Task 3.3.
-        raise NotImplementedError("Need to implement for Task 3.3")
+        to_index_strides(out_pos, out_shape, out_strides, out_index)
+
+        for i in range((a_shape[reduce_dim] + BLOCK_DIM - 1) // BLOCK_DIM):
+            if pos + BLOCK_DIM * i < a_shape[reduce_dim]:
+                out_index[reduce_dim] = pos + BLOCK_DIM * i
+                a_i = int(index_to_position(out_index, a_strides))
+                if pos == 0:
+                    val = reduce_value if i == 0 else cache[pos] 
+                    cache[pos] = fn(val, a_storage[a_i])
+                else:
+                    cache[pos] = a_storage[a_i]
+            else:
+                cache[pos] = reduce_value
+            cuda.syncthreads()
+
+            off = BLOCK_DIM // 2
+            while off > 0:
+                if pos < off:
+                    cache[pos] = fn(cache[pos], cache[pos + off])
+                off >>= 1
+                cuda.syncthreads()
+        if pos == 0:
+            out[out_pos] = cache[0]
+
 
     return cuda.jit()(_reduce)  # type: ignore
 
@@ -315,8 +378,26 @@ def _mm_practice(out: Storage, a: Storage, b: Storage, size: int) -> None:
         size (int): size of the square
     """
     BLOCK_DIM = 32
-    # TODO: Implement for Task 3.3.
-    raise NotImplementedError("Need to implement for Task 3.3")
+    a_shared = cuda.shared.array((BLOCK_DIM, BLOCK_DIM), numba.float64)
+    b_shared = cuda.shared.array((BLOCK_DIM, BLOCK_DIM), numba.float64)
+
+    i = cuda.blockIdx.x * cuda.blockDim.x + cuda.threadIdx.x
+    j = cuda.blockIdx.y * cuda.blockDim.y + cuda.threadIdx.y
+    local_i = cuda.threadIdx.x
+    local_j = cuda.threadIdx.y
+
+    dot = 0
+    for k in range(0, size, BLOCK_DIM):
+        if i < size and k + local_j < size:
+          a_shared[local_i, local_j] = a[i, k + local_j]
+        if k + local_i < size and j < size:
+          b_shared[local_i, local_j] = b[k + local_i, j]
+        cuda.syncthreads()
+
+        for local_k in range(min(BLOCK_DIM, size - k)):
+            dot = dot + a_shared[local_i, local_k] * b_shared[local_k, local_j]
+    if i < size and j < size:
+        out[i, j] = dot
 
 
 jit_mm_practice = cuda.jit()(_mm_practice)

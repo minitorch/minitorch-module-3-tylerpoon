@@ -268,11 +268,12 @@ def tensor_reduce(
 
             idx[reduce_dim] = 0
             a_i = int(index_to_position(idx, a_strides))
-            out[i] = a_storage[a_i]
+            t = a_storage[a_i]
 
             for j in range(1, a_shape[reduce_dim]):
                 a_i += a_strides[reduce_dim]
-                out[i] = fn(out[i], a_storage[a_i])
+                t = fn(t, a_storage[a_i])
+            out[i] = t
 
     return njit(parallel=True)(_reduce)  # type: ignore
 
@@ -320,9 +321,30 @@ def _tensor_matrix_multiply(
     """
     a_batch_stride = a_strides[0] if a_shape[0] > 1 else 0
     b_batch_stride = b_strides[0] if b_shape[0] > 1 else 0
+    a_dims = len(a_shape)
+    b_dims = len(b_shape)
+    out_dims = len(out_shape)
+    a_diff = out_dims - a_dims
+    b_diff = out_dims - b_dims
 
-    # TODO: Implement for Task 3.2.
-    raise NotImplementedError("Need to implement for Task 3.2")
+    for i in prange(len(out)):
+        a_i = 0
+        b_i = 0
+        # hack for parallel rewrite bug
+        ordinal = 0 + i
+        for j in range(out_dims):
+            out_idx = ordinal // out_strides[j]
+            ordinal -= out_idx * out_strides[j]
+
+            if j - a_diff >= 0 and j != a_dims - 1:
+                a_i += a_strides[j - a_diff] * min(out_idx, a_shape[j - a_diff] - 1)
+            if j - b_diff >= 0 and j != b_dims - 2:
+                b_i += b_strides[j - b_diff] * min(out_idx, b_shape[j - b_diff] - 1)
+
+        t = 0
+        for j in range(a_shape[-1]):
+            t += a_storage[a_i + j * a_strides[-1]] * b_storage[b_i + j * b_strides[-2]]
+        out[i] = t
 
 
 tensor_matrix_multiply = njit(parallel=True, fastmath=True)(_tensor_matrix_multiply)
