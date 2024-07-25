@@ -11,6 +11,7 @@ from .tensor_data import (
     index_to_position,
     shape_broadcast,
     to_index,
+    to_index_strides,
 )
 from .tensor_ops import MapProto, TensorOps
 
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 # If you get an error, read the docs for NUMBA as to what is allowed
 # in these functions.
 to_index = njit(inline="always")(to_index)
+to_index_strides = njit(inline="always")(to_index_strides)
 index_to_position = njit(inline="always")(index_to_position)
 broadcast_index = njit(inline="always")(broadcast_index)
 
@@ -159,8 +161,18 @@ def tensor_map(
         in_shape: Shape,
         in_strides: Strides,
     ) -> None:
-        # TODO: Implement for Task 3.1.
-        raise NotImplementedError("Need to implement for Task 3.1")
+        aligned = np.array_equal(out_strides, in_strides) and np.array_equal(out_shape, in_shape)
+        for i in prange(len(out)):
+            if aligned:
+                out[i] = fn(in_storage[i])
+            else:
+                out_index = np.zeros_like(out_shape)
+                to_index_strides(i, out_shape, out_strides, out_index)
+
+                in_index = np.zeros_like(in_shape)
+                broadcast_index(out_index, out_shape, in_shape, in_index)
+                in_i = int(index_to_position(in_index, in_strides))
+                out[i] = fn(in_storage[in_i])
 
     return njit(parallel=True)(_map)  # type: ignore
 
@@ -198,8 +210,23 @@ def tensor_zip(
         b_shape: Shape,
         b_strides: Strides,
     ) -> None:
-        # TODO: Implement for Task 3.1.
-        raise NotImplementedError("Need to implement for Task 3.1")
+        aligned = np.array_equal(out_strides, a_strides) and np.array_equal(out_strides, b_strides) and np.array_equal(out_shape, a_shape) and np.array_equal(out_shape, b_shape)
+        for i in prange(len(out)):
+            if aligned:
+                out[i] = fn(a_storage[i], b_storage[i])
+            else:
+                out_index = np.zeros_like(out_shape)
+                to_index_strides(i, out_shape, out_strides, out_index)
+
+                a_index = np.zeros_like(a_shape)
+                broadcast_index(out_index, out_shape, a_shape, a_index)
+                a_i = int(index_to_position(a_index, a_strides))
+
+                b_index = np.zeros_like(b_shape)
+                broadcast_index(out_index, out_shape, b_shape, b_index)
+                b_i = int(index_to_position(b_index, b_strides))
+
+                out[i] = fn(a_storage[a_i], b_storage[b_i])
 
     return njit(parallel=True)(_zip)  # type: ignore
 
@@ -232,8 +259,20 @@ def tensor_reduce(
         a_strides: Strides,
         reduce_dim: int,
     ) -> None:
-        # TODO: Implement for Task 3.1.
-        raise NotImplementedError("Need to implement for Task 3.1")
+        for i in prange(len(out)):
+            idx = np.zeros_like(out_shape)
+            # hack to prevent overwriting parallel loop index, numba bug with inlining presumably
+            i_copy = 0
+            i_copy = i_copy + i
+            to_index_strides(i_copy, out_shape, out_strides, idx)
+
+            idx[reduce_dim] = 0
+            a_i = int(index_to_position(idx, a_strides))
+            out[i] = a_storage[a_i]
+
+            for j in range(1, a_shape[reduce_dim]):
+                a_i += a_strides[reduce_dim]
+                out[i] = fn(out[i], a_storage[a_i])
 
     return njit(parallel=True)(_reduce)  # type: ignore
 
